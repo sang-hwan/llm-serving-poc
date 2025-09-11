@@ -1,0 +1,10 @@
+﻿# Logs and evidence
+logs/
+evidence/
+# Python env and caches (if used later)
+.venv/
+__pycache__/
+*.pyc
+# OS junk
+.DS_Store
+Thumbs.db
