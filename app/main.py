@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Header, Response
+from fastapi import FastAPI, Header, Response, Request, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from pathlib import Path
 import datetime as dt
-import time, uuid, json, csv
+import time, uuid, json, csv, os, asyncio
 
 APP_TITLE = "LLM Serving PoC"
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -12,13 +13,39 @@ METRICS_DIR = BASE_DIR / "metrics"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
+# 공통 CSV 스키마
 METRICS_CSV = METRICS_DIR / "requests.csv"
-METRICS_HEADER = ["timestamp","route","request_id","ttft_ms","latency_ms","status"]
+METRICS_HEADER_V2 = [
+    "timestamp","route","request_id","status","is_stream",
+    "ttft_ms","latency_ms","chunks","bytes","reason",
+    "prompt_chars","output_chars","timeout_ms"
+]
 
-# CSV 헤더 보장
-if not METRICS_CSV.exists():
-    with METRICS_CSV.open("w", encoding="utf-8", newline="") as f:
-        csv.writer(f).writerow(METRICS_HEADER)
+# 헤더 자동 마이그레이션(레거시 파일은 보존)
+def _ensure_metrics_header_v2():
+    if not METRICS_CSV.exists():
+        with METRICS_CSV.open("w", encoding="utf-8", newline="") as f:
+            csv.writer(f).writerow(METRICS_HEADER_V2)
+        return
+
+    try:
+        with METRICS_CSV.open("r", encoding="utf-8", newline="") as f:
+            first = f.readline().strip()
+    except Exception:
+        first = ""
+
+    expected = ",".join(METRICS_HEADER_V2)
+    if not first or first.replace(" ", "") != expected.replace(" ", ""):
+        ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        legacy = METRICS_DIR / f"requests_legacy_{ts}.csv"
+        try:
+            os.replace(METRICS_CSV, legacy)
+        except Exception as e:
+            print(f"[metrics-rotate-warn] {e}")
+        with METRICS_CSV.open("w", encoding="utf-8", newline="") as f:
+            csv.writer(f).writerow(METRICS_HEADER_V2)
+
+_ensure_metrics_header_v2()
 
 SERVER_STARTED_AT = dt.datetime.now(dt.timezone.utc)
 app = FastAPI(title=APP_TITLE)
@@ -38,10 +65,27 @@ def _append_jsonl(record: dict) -> None:
     except Exception as e:
         print(f"[jsonl-write-error] {e}")
 
-def _append_metrics(route: str, request_id: str, ttft_ms: int, latency_ms: int, status: int) -> None:
+# 공통 CSV 기록. extras는 미지정 시 기본값 채움
+def _append_metrics(route: str, request_id: str, ttft_ms: int, latency_ms: int,
+                    status: int, **extras) -> None:
+    row = [
+        _now_iso(),
+        route,
+        request_id,
+        status,
+        extras.get("is_stream", False),
+        ttft_ms,
+        latency_ms,
+        extras.get("chunks", 0),
+        extras.get("bytes", 0),
+        extras.get("reason", "ok"),
+        extras.get("prompt_chars", None),
+        extras.get("output_chars", None),
+        extras.get("timeout_ms", None),
+    ]
     try:
         with METRICS_CSV.open("a", encoding="utf-8", newline="") as f:
-            csv.writer(f).writerow([_now_iso(), route, request_id, ttft_ms, latency_ms, status])
+            csv.writer(f).writerow(row)
     except Exception as e:
         print(f"[csv-write-error] {e}")
 
@@ -50,7 +94,7 @@ def _coalesce_request_id(x_request_id: Optional[str]) -> str:
         rid = x_request_id.strip()
         if 1 <= len(rid) <= 120:
             return rid
-    return str(uuid.uuid4())
+    return f"req-{uuid.uuid4().hex[:12]}"
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -60,6 +104,7 @@ class GenerateResponse(BaseModel):
     id: str
     output: str
 
+# 컨테이너/프로세스가 죽었는지, 메인 루프가 응답하는지만 확인
 @app.get("/health")
 def health(x_request_id: Optional[str] = Header(None)):
     t0 = time.perf_counter()                     # 1) 성능 측정 시작(고해상도, 단조 증가 타이머)
@@ -78,10 +123,15 @@ def health(x_request_id: Optional[str] = Header(None)):
     status = 200
 
     # 5) 라인로그(JSONL) + 지표(CSV) 기록
-    record = {"ts": _now_iso(), "route": "/health", "request_id": rid,
-              "ttft_ms": ttft_ms, "latency_ms": latency_ms, "status": status}
+    record = {
+        "ts": _now_iso(), "route": "/health", "request_id": rid,
+        "status": status, "is_stream": False,
+        "ttft_ms": ttft_ms, "latency_ms": latency_ms,
+        "chunks": 0, "bytes": 0, "reason": "ok"
+    }
     _append_jsonl(record)                         # logs/requests-YYYYMMDD.jsonl로 한 줄 append
-    _append_metrics("/health", rid, ttft_ms, latency_ms, status)  # metrics/requests.csv로 누적
+    _append_metrics("/health", rid, ttft_ms, latency_ms, status,
+                    is_stream=False, chunks=0, bytes=0, reason="ok")  # metrics/requests.csv로 누적
 
     # 6) 응답 반환(직접 직렬화)
     return Response(
@@ -91,6 +141,7 @@ def health(x_request_id: Optional[str] = Header(None)):
         headers={"X-Request-ID": rid},
     )
 
+# 텍스트 생성 API
 @app.post("/v1/generate", response_model=GenerateResponse)
 def generate(body: GenerateRequest, x_request_id: Optional[str] = Header(None)):
     t0 = time.perf_counter()
@@ -104,14 +155,23 @@ def generate(body: GenerateRequest, x_request_id: Optional[str] = Header(None)):
     resp_obj = {"id": rid, "output": output}
     t_end = time.perf_counter()
 
-    ttft_ms = int((t_first - t0) * 1000)
-    latency_ms = int((t_end - t0) * 1000)
+    ttft_ms    = int((t_first - t0) * 1000)
+    latency_ms = int((t_end   - t0) * 1000)
     status = 200
 
-    record = {"ts": _now_iso(), "route": "/v1/generate", "request_id": rid,
-              "ttft_ms": ttft_ms, "latency_ms": latency_ms, "status": status}
+    record = {
+        "ts": _now_iso(), "route": "/v1/generate", "request_id": rid,
+        "status": status, "is_stream": False,
+        "ttft_ms": ttft_ms, "latency_ms": latency_ms,
+        "chunks": 0, "bytes": 0, "reason": "ok",
+        "prompt_chars": len(body.prompt) if getattr(body, "prompt", None) else None,
+        "output_chars": len(output)
+    }
     _append_jsonl(record)
-    _append_metrics("/v1/generate", rid, ttft_ms, latency_ms, status)
+    _append_metrics("/v1/generate", rid, ttft_ms, latency_ms, status,
+                    is_stream=False, chunks=0, bytes=0, reason="ok",
+                    prompt_chars=len(body.prompt) if getattr(body, "prompt", None) else None,
+                    output_chars=len(output))
 
     return Response(
         content=json.dumps(resp_obj, ensure_ascii=False),
@@ -119,3 +179,111 @@ def generate(body: GenerateRequest, x_request_id: Optional[str] = Header(None)):
         media_type="application/json",
         headers={"X-Request-ID": rid},
     )
+
+# SSE(Server-Sent Events) 방식으로 prompt를 8자 단위로 쪼개 증분 전송
+@app.get("/v1/stream")
+async def stream(
+    request: Request,
+    prompt: str = Query(..., description="text prompt"),
+    max_tokens: int = Query(32, ge=1, le=4096),
+    delay_ms: int = Query(40, ge=0, le=2000),
+    timeout_ms: int = Query(60_000, ge=1_000, le=600_000),
+    x_request_id: Optional[str] = Header(None),
+):
+    t0   = time.perf_counter()
+    rid  = _coalesce_request_id(x_request_id)
+    route = "/v1/stream"
+
+    # placeholder 토큰화: prompt 일부를 고정 길이 조각으로 스트리밍
+    token_size = 8
+    text = prompt[:max_tokens]
+    chunks_total = (len(text) + token_size - 1) // token_size
+
+    state = {
+        "first_sent": False,
+        "t_first": None,
+        "chunks": 0,
+        "bytes": 0,
+        "reason": "ok",
+        "status": 200,
+        "output_acc": []
+    }
+
+    async def event_gen():
+        try:
+            # 시작 알림(옵션)
+            yield f"event: start\ndata: {json.dumps({'id': rid, 'route': route})}\n\n"
+
+            start = time.perf_counter()
+            for idx in range(chunks_total):
+                # 클라이언트 취소 감지
+                if await request.is_disconnected():
+                    state["reason"] = "client_cancel"; state["status"] = 499
+                    break
+                # 타임아웃
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+                if elapsed_ms > timeout_ms:
+                    state["reason"] = "timeout"; state["status"] = 504
+                    break
+
+                piece = text[idx*token_size:(idx+1)*token_size]
+                payload = {"id": rid, "index": idx, "delta": piece, "finished": False}
+                line = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+                if not state["first_sent"]:
+                    state["first_sent"] = True
+                    state["t_first"] = time.perf_counter()
+
+                state["chunks"] += 1
+                state["bytes"]  += len(line.encode("utf-8"))
+                state["output_acc"].append(piece)
+                yield line
+
+                if delay_ms:
+                    await asyncio.sleep(delay_ms / 1000)
+
+            # 종료 이벤트
+            done = {"id": rid, "finished": True, "reason": state["reason"]}
+            yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"
+
+        except asyncio.CancelledError:
+            state["reason"] = "client_cancel"; state["status"] = 499
+            raise
+        except Exception as e:
+            state["reason"] = "error"; state["status"] = 500
+            try:
+                err = {"id": rid, "finished": True, "reason": "error", "message": str(e)}
+                yield f"event: error\ndata: {json.dumps(err, ensure_ascii=False)}\n\n"
+            finally:
+                raise
+        finally:
+            # 공통 스키마 로깅
+            t_end = time.perf_counter()
+            ttft_ms    = int(((state["t_first"] or t_end) - t0) * 1000)
+            latency_ms = int((t_end - t0) * 1000)
+
+            rec = {
+                "ts": _now_iso(), "route": route, "request_id": rid,
+                "status": state["status"], "is_stream": True,
+                "ttft_ms": ttft_ms, "latency_ms": latency_ms,
+                "chunks": state["chunks"], "bytes": state["bytes"],
+                "reason": state["reason"],
+                "prompt_chars": len(prompt),
+                "output_chars": len("".join(state["output_acc"])),
+                "timeout_ms": timeout_ms
+            }
+            _append_jsonl(rec)
+            _append_metrics(route, rid, ttft_ms, latency_ms, state["status"],
+                            is_stream=True, chunks=state["chunks"], bytes=state["bytes"],
+                            reason=state["reason"], prompt_chars=len(prompt),
+                            output_chars=len("".join(state["output_acc"])),
+                            timeout_ms=timeout_ms)
+
+    headers = {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "X-Request-ID": rid,
+    }
+    return StreamingResponse(event_gen(), headers=headers, status_code=200)
