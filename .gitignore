@@ -1,6 +1,7 @@
 ﻿# Logs and evidence
 logs/
 evidence/
+*.zip
 # Python env and caches (if used later)
 .venv/
 __pycache__/

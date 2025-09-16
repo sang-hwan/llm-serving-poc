@@ -15,17 +15,19 @@ METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 공통 CSV 스키마
 METRICS_CSV = METRICS_DIR / "requests.csv"
-METRICS_HEADER_V2 = [
+METRICS_HEADER_V3 = [
     "timestamp","route","request_id","status","is_stream",
     "ttft_ms","latency_ms","chunks","bytes","reason",
-    "prompt_chars","output_chars","timeout_ms"
+    "prompt_chars","output_chars","timeout_ms",
+    "decode_ms","tpot_chunks_per_sec","delay_ms","token_size"
 ]
+METRICS_HEADER = METRICS_HEADER_V3  # 현재 활성 스키마
 
 # 헤더 자동 마이그레이션(레거시 파일은 보존)
-def _ensure_metrics_header_v2():
+def _ensure_metrics_header():
     if not METRICS_CSV.exists():
         with METRICS_CSV.open("w", encoding="utf-8", newline="") as f:
-            csv.writer(f).writerow(METRICS_HEADER_V2)
+            csv.writer(f).writerow(METRICS_HEADER)
         return
 
     try:
@@ -34,7 +36,7 @@ def _ensure_metrics_header_v2():
     except Exception:
         first = ""
 
-    expected = ",".join(METRICS_HEADER_V2)
+    expected = ",".join(METRICS_HEADER)
     if not first or first.replace(" ", "") != expected.replace(" ", ""):
         ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         legacy = METRICS_DIR / f"requests_legacy_{ts}.csv"
@@ -43,9 +45,9 @@ def _ensure_metrics_header_v2():
         except Exception as e:
             print(f"[metrics-rotate-warn] {e}")
         with METRICS_CSV.open("w", encoding="utf-8", newline="") as f:
-            csv.writer(f).writerow(METRICS_HEADER_V2)
+            csv.writer(f).writerow(METRICS_HEADER)
 
-_ensure_metrics_header_v2()
+_ensure_metrics_header()
 
 SERVER_STARTED_AT = dt.datetime.now(dt.timezone.utc)
 app = FastAPI(title=APP_TITLE)
@@ -82,6 +84,10 @@ def _append_metrics(route: str, request_id: str, ttft_ms: int, latency_ms: int,
         extras.get("prompt_chars", None),
         extras.get("output_chars", None),
         extras.get("timeout_ms", None),
+        extras.get("decode_ms", None),
+        extras.get("tpot_chunks_per_sec", None),
+        extras.get("delay_ms", None),
+        extras.get("token_size", None),
     ]
     try:
         with METRICS_CSV.open("a", encoding="utf-8", newline="") as f:
@@ -131,7 +137,9 @@ def health(x_request_id: Optional[str] = Header(None)):
     }
     _append_jsonl(record)                         # logs/requests-YYYYMMDD.jsonl로 한 줄 append
     _append_metrics("/health", rid, ttft_ms, latency_ms, status,
-                    is_stream=False, chunks=0, bytes=0, reason="ok")  # metrics/requests.csv로 누적
+                    is_stream=False, chunks=0, bytes=0, reason="ok",
+                    decode_ms=None, tpot_chunks_per_sec=None,
+                    delay_ms=None, token_size=None)  # metrics/requests.csv로 누적
 
     # 6) 응답 반환(직접 직렬화)
     return Response(
@@ -171,7 +179,9 @@ def generate(body: GenerateRequest, x_request_id: Optional[str] = Header(None)):
     _append_metrics("/v1/generate", rid, ttft_ms, latency_ms, status,
                     is_stream=False, chunks=0, bytes=0, reason="ok",
                     prompt_chars=len(body.prompt) if getattr(body, "prompt", None) else None,
-                    output_chars=len(output))
+                    output_chars=len(output),
+                    decode_ms=None, tpot_chunks_per_sec=None,
+                    delay_ms=None, token_size=None)
 
     return Response(
         content=json.dumps(resp_obj, ensure_ascii=False),
@@ -239,7 +249,12 @@ async def stream(
                 state["output_acc"].append(piece)
                 yield line
 
-                if delay_ms:
+                # 마지막 청크 시각 기록(정확한 decode_ms/TPOT 계산용)
+                if idx == chunks_total - 1:
+                    state["t_last"] = time.perf_counter()
+
+                # 마지막 청크 뒤에는 sleep 생략 → (chunks−1)번만 지연
+                if delay_ms and idx < chunks_total - 1:
                     await asyncio.sleep(delay_ms / 1000)
 
             # 종료 이벤트
@@ -261,6 +276,13 @@ async def stream(
             t_end = time.perf_counter()
             ttft_ms    = int(((state["t_first"] or t_end) - t0) * 1000)
             latency_ms = int((t_end - t0) * 1000)
+            
+            # 첫 청크 → 마지막 청크 구간(디코딩 시간)
+            t_last = state.get("t_last", None)
+            decode_ms = int(((t_last or t_end) - (state["t_first"] or t_end)) * 1000) if state["first_sent"] else 0
+
+            # TPOT: 청크/초 (간격 개수 = chunks−1)
+            tpot = (state["chunks"] - 1) / (decode_ms / 1000) if state["chunks"] > 1 and decode_ms > 0 else None
 
             rec = {
                 "ts": _now_iso(), "route": route, "request_id": rid,
@@ -268,16 +290,25 @@ async def stream(
                 "ttft_ms": ttft_ms, "latency_ms": latency_ms,
                 "chunks": state["chunks"], "bytes": state["bytes"],
                 "reason": state["reason"],
-                "prompt_chars": len(prompt),
-                "output_chars": len("".join(state["output_acc"])),
-                "timeout_ms": timeout_ms
+                "prompt_chars": len(prompt), "output_chars": len("".join(state["output_acc"])),
+                "timeout_ms": timeout_ms,
+
+                # (선택) 분석 편의용 추가 컬럼
+                "decode_ms": decode_ms,
+                "tpot_chunks_per_sec": tpot,
+                "delay_ms": delay_ms,
+                "token_size": token_size,
             }
             _append_jsonl(rec)
             _append_metrics(route, rid, ttft_ms, latency_ms, state["status"],
                             is_stream=True, chunks=state["chunks"], bytes=state["bytes"],
                             reason=state["reason"], prompt_chars=len(prompt),
                             output_chars=len("".join(state["output_acc"])),
-                            timeout_ms=timeout_ms)
+                            timeout_ms=timeout_ms,
+                            decode_ms=decode_ms,
+                            tpot_chunks_per_sec=tpot,
+                            delay_ms=delay_ms,
+                            token_size=token_size)
 
     headers = {
         "Content-Type": "text/event-stream; charset=utf-8",
