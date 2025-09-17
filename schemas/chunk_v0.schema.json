@@ -1,0 +1,16 @@
+﻿{ "$schema":"http://json-schema.org/draft-07/schema#",
+  "title":"chunk_v0",
+  "type":"object",
+  "required":["id","finished"],
+  "properties":{
+    "id":{"type":"string"},
+    "index":{"type":"integer","minimum":0},
+    "delta":{"type":"string"},
+    "finished":{"type":"boolean"},
+    "reason":{"type":"string"}
+  },
+  "allOf":[
+    {"if":{"properties":{"finished":{"const":false}}},"then":{"required":["index","delta"]}}
+  ],
+  "additionalProperties":false
+}

@@ -1,0 +1,19 @@
+﻿{ "$schema":"http://json-schema.org/draft-07/schema#",
+  "title":"error_v0",
+  "type":"object",
+  "required":["request_id","error"],
+  "properties":{
+    "request_id":{"type":"string"},
+    "error":{
+      "type":"object",
+      "required":["code","message","retryable"],
+      "properties":{
+        "code":{"type":"string"},
+        "message":{"type":"string","maxLength":512},
+        "retryable":{"type":"boolean"}
+      },
+      "additionalProperties":false
+    }
+  },
+  "additionalProperties":false
+}
