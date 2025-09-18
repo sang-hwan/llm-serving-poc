@@ -1,15 +1,15 @@
-﻿{ "$schema":"http://json-schema.org/draft-07/schema#",
-  "$id":"https://example.com/schemas/completion.schema.json",
-  "schema_version":1,
-  "title":"completion_v1",
-  "type":"object",
-  "required":["request_id","model","created","output"],
-  "properties":{
-    "request_id":{"type":"string"},
-    "model":{"type":"string"},
-    "created":{"type":"integer"},
-    "output":{"type":"object","required":["text"],"properties":{"text":{"type":"string"}}},
-    "meta":{"type":"object","additionalProperties":true}
-  },
-  "additionalProperties":false
-}
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "completion@v1",
+    "title": "Completion",
+    "version": "v1",
+    "type": "object",
+    "required": ["id", "output"],
+    "properties": {
+      "id":     { "type": "string", "minLength": 1 },
+      "output": { "type": "string" },
+      "metrics": {
+        "type": "object",
+        "additionalProperties": true}
+    },
+    "additionalProperties": false}

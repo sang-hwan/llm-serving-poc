@@ -1,0 +1,8 @@
+timestamp,kind,path,is_valid,reason,request_id,schema_version,fields_missing,fields_extra,type_errors,size_bytes
+2025-09-18T08:30:29.502027,completion,tests\samples\valid\completion_01.json,1,ok,r-001,v1,,,,80
+2025-09-18T08:32:22.868115,chunk,tests\samples\valid\chunk\chunk_00.json,1,ok,r-001,v1,,,,46
+2025-09-18T08:32:22.868115,chunk,tests\samples\valid\chunk\chunk_01.json,1,ok,r-001,v1,,,,45
+2025-09-18T08:32:59.378926,error,tests\samples\invalid\errors.ndjson:1,1,ok,r-err-001,v1,,,,36
+2025-09-18T08:32:59.378926,error,tests\samples\invalid\errors.ndjson:2,0,invalid_schema,r-err-002,v1,,,,19
+2025-09-18T08:32:59.378926,error,tests\samples\invalid\errors.ndjson:3,0,non_json,,v1,,,,15
+2025-09-18T08:32:59.378926,error,tests\samples\invalid\errors.ndjson:4,0,invalid_schema,,v1,,,,35

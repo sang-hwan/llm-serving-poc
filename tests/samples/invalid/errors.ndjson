@@ -1,0 +1,4 @@
+{"id":"r-err-001","error":"boom"}
+{"id":"r-err-002"}
+not-a-json-line
+{"id":123,"error":"bad type id"}

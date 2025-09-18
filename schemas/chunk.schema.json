@@ -1,0 +1,13 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "chunk@v1",
+    "title": "Chunk",
+    "version": "v1",
+    "type": "object",
+    "required": ["id", "delta", "index"],
+    "properties": {
+      "id":    { "type": "string", "minLength": 1 },
+      "delta": { "type": "string" },
+      "index": { "type": "integer", "minimum": 0 }
+    },
+    "additionalProperties": false}

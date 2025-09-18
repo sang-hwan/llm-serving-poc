@@ -1,0 +1,12 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "error@v1",
+    "title": "Error",
+    "version": "v1",
+    "type": "object",
+    "required": ["id", "error"],
+    "properties": {
+      "id":    { "type": "string", "minLength": 1 },
+      "error": { "type": "string", "minLength": 1 }
+    },
+    "additionalProperties": true}

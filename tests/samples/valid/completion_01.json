@@ -1,0 +1,1 @@
+{ "id":"r-001","output":"hello","metrics":{"ttft_ms":100,"total_ms":200} }
